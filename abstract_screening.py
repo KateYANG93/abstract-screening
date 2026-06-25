@@ -141,10 +141,15 @@ ELIGIBLE_TEAM_PERFORMANCE_PHRASES = [
     "team effectiveness",
     "group effectiveness",
     "unit performance",
+    "unit effectiveness",
     "branch performance",
+    "branch effectiveness",
     "store performance",
+    "store effectiveness",
     "restaurant performance",
+    "restaurant effectiveness",
     "outlet performance",
+    "outlet effectiveness",
     "service performance",
     "team productivity",
     "group productivity",
@@ -154,12 +159,47 @@ ELIGIBLE_TEAM_PERFORMANCE_PHRASES = [
     "team output",
     "unit output",
     "objective team performance",
+    "objective sales",
+    "objective output",
+    "objective sales output",
     "supervisor rated team performance",
     "supervisor-rated team performance",
     "leader rated team performance",
     "leader-rated team performance",
+    "member rated team performance",
+    "member-rated team performance",
+    "member rated group performance",
+    "member-rated group performance",
     "customer rated team performance",
     "customer-rated team performance",
+    "customer rated group performance",
+    "customer-rated group performance",
+]
+
+PERFORMANCE_EFFECTIVENESS_OUTCOME_PHRASES = [
+    "performance",
+    "performances",
+    "effectiveness",
+    "effective performance",
+    "productivity",
+    "output",
+    "outputs",
+    "sales",
+    "objective sales",
+    "objective output",
+    "service performance",
+    "service effectiveness",
+    "task performance",
+    "rated performance",
+    "goal attainment",
+    "goal achievement",
+    "team effectiveness",
+    "group effectiveness",
+    "unit effectiveness",
+    "branch effectiveness",
+    "store effectiveness",
+    "restaurant effectiveness",
+    "outlet effectiveness",
 ]
 
 INNOVATION_CREATIVITY_PHRASES = [
@@ -428,8 +468,23 @@ INELIGIBLE_PUBLICATION_PHRASES = [
     "systematic review",
     "narrative review",
     "scoping review",
+    "review article",
+    "research review",
+    "integrative review",
+    "bibliometric review",
     "meta analysis",
     "meta-analysis",
+    "meta analyses",
+    "meta-analyses",
+    "meta analytic",
+    "meta-analytic",
+    "meta analytical",
+    "meta-analytical",
+    "meta analytically",
+    "meta-analytically",
+    "meta analytical correlation matrix",
+    "meta-analytical correlation matrix",
+    "meta analytic correlation matrix",
     "editorial",
     "commentary",
     "practitioner article",
@@ -506,6 +561,7 @@ SCREENING_COLUMNS = [
     "direct_tmx_lmx_title_abstract_signal",
     "tmx_lmx_signal",
     "performance_signal",
+    "outcome_related_signal",
     "innovation_creativity_only_signal",
     "unpublished_signal",
     "team_context_signal",
@@ -876,6 +932,7 @@ def extract_signals(row: pd.Series, screening_text: str) -> dict:
     quantitative = match_phrases(screening_text, QUANTITATIVE_PHRASES)
     wrong_context = match_phrases(screening_text, WRONG_CONTEXT_PHRASES)
     non_performance = match_phrases(screening_text, NON_PERFORMANCE_OUTCOME_PHRASES)
+    outcome_related = match_phrases(screening_text, PERFORMANCE_EFFECTIVENESS_OUTCOME_PHRASES)
     other_leadership = match_phrases(screening_text, GENERAL_LEADERSHIP_CONSTRUCT_PHRASES)
     other_non_exchange = match_phrases(screening_text, OTHER_NON_EXCHANGE_CONSTRUCT_PHRASES)
     individual_level_focus = match_phrases(screening_text, INDIVIDUAL_LEVEL_FOCUS_PHRASES)
@@ -896,6 +953,12 @@ def extract_signals(row: pd.Series, screening_text: str) -> dict:
     )
 
     performance_only_non_perf = bool(non_performance) and not performance_info["has_eligible_performance"]
+    has_outcome_related = bool(
+        outcome_related
+        or eligible_performance
+        or individual_performance
+        or innovation_creativity
+    )
 
     return {
         "tmx_lmx": tmx_lmx,
@@ -911,6 +974,8 @@ def extract_signals(row: pd.Series, screening_text: str) -> dict:
         "quantitative": quantitative,
         "wrong_context": wrong_context,
         "non_performance": non_performance,
+        "outcome_related": outcome_related,
+        "has_outcome_related": has_outcome_related,
         "other_leadership": other_leadership,
         "other_non_exchange": other_non_exchange,
         "individual_level_focus": individual_level_focus,
@@ -1059,6 +1124,29 @@ def classify_record(row: pd.Series) -> dict:
             secondary_reasons, inclusion_signals, exclusion_signals, signals, False, notes,
         )
 
+    # Clearly individual-level only analysis without eligible team/unit performance
+    if has_individual_only and not has_eligible_performance:
+        return _build_result(
+            screening_text, "exclude_likely", "high", "wrong_level_individual_only",
+            secondary_reasons, inclusion_signals, exclusion_signals, signals, False, notes,
+        )
+
+    # 6b. Non-performance outcomes only (e.g., trust, satisfaction) without eligible performance
+    if signals["performance_only_non_perf"] and not signals["has_outcome_related"]:
+        secondary_reasons.append("non_performance_outcome_only")
+        return _build_result(
+            screening_text, "exclude_likely", "high", "no_eligible_performance_effectiveness_outcome",
+            secondary_reasons, inclusion_signals, exclusion_signals, signals, False, notes,
+        )
+
+    # 6c. Individual or firm/organization-level performance without team/unit outcome
+    if signals["has_individual_performance"] and not has_eligible_performance:
+        secondary_reasons.append("individual_or_firm_performance_without_team_unit_outcome")
+        return _build_result(
+            screening_text, "exclude_likely", "high", "no_eligible_performance_effectiveness_outcome",
+            secondary_reasons, inclusion_signals, exclusion_signals, signals, False, notes,
+        )
+
     # Wrong student/lab context without organizational signals (TMX/LMX present)
     if has_wrong_context and not has_team_context:
         return _build_result(
@@ -1070,13 +1158,6 @@ def classify_record(row: pd.Series) -> dict:
         return _build_result(
             screening_text, "maybe_manual_review", "medium", "mixed_student_and_organizational_context",
             secondary_reasons, inclusion_signals, exclusion_signals, signals, True, notes,
-        )
-
-    # Clearly individual-level only analysis without eligible team/unit performance
-    if has_individual_only and not has_eligible_performance:
-        return _build_result(
-            screening_text, "exclude_likely", "high", "wrong_level_individual_only",
-            secondary_reasons, inclusion_signals, exclusion_signals, signals, False, notes,
         )
 
     # 7. TMX/LMX + eligible team/unit performance
@@ -1096,10 +1177,34 @@ def classify_record(row: pd.Series) -> dict:
             secondary_reasons, inclusion_signals, exclusion_signals, signals, True, notes,
         )
 
-    # 8. TMX/LMX present but performance/effectiveness outcome unclear
+    # 8. TMX/LMX present but no performance/effectiveness-related outcome
+    if not signals["has_outcome_related"]:
+        secondary_reasons.append("no_performance_effectiveness_or_similar_outcome_signal")
+        return _build_result(
+            screening_text,
+            "exclude_likely",
+            "high",
+            "no_eligible_performance_effectiveness_outcome",
+            secondary_reasons,
+            inclusion_signals,
+            exclusion_signals,
+            signals,
+            False,
+            notes,
+        )
+
+    # 9. TMX/LMX present and some outcome-related wording exists, but eligible team/unit outcome is unclear
     return _build_result(
-        screening_text, "maybe_manual_review", "medium", "tmx_lmx_present_outcome_unclear",
-        secondary_reasons, inclusion_signals, exclusion_signals, signals, True, notes,
+        screening_text,
+        "maybe_manual_review",
+        "medium",
+        "outcome_related_but_team_unit_level_unclear",
+        secondary_reasons,
+        inclusion_signals,
+        exclusion_signals,
+        signals,
+        True,
+        notes,
     )
 
 
@@ -1132,6 +1237,7 @@ def _build_result(
         "direct_tmx_lmx_title_abstract_signal": format_signal_list(signals["direct_tmx_lmx"]),
         "tmx_lmx_signal": format_signal_list(signals["tmx_lmx"]),
         "performance_signal": format_signal_list(signals["performance"]),
+        "outcome_related_signal": format_signal_list(signals["outcome_related"]),
         "innovation_creativity_only_signal": (
             "yes" if signals["innovation_creativity_only"] else ""
         ),
@@ -1187,6 +1293,26 @@ def build_screening_summary(df: pd.DataFrame) -> pd.DataFrame:
             "count_unpublished_or_working_paper",
             int((df["primary_reason"] == "unpublished_or_working_paper").sum()),
         ),
+        (
+            "count_no_eligible_performance_effectiveness_outcome",
+            int((df["primary_reason"] == "no_eligible_performance_effectiveness_outcome").sum()),
+        ),
+        (
+            "count_non_performance_outcome_only",
+            count_secondary_reason(df, "non_performance_outcome_only"),
+        ),
+        (
+            "count_no_performance_effectiveness_or_similar_outcome_signal",
+            count_secondary_reason(df, "no_performance_effectiveness_or_similar_outcome_signal"),
+        ),
+        (
+            "count_individual_or_firm_performance_without_team_unit_outcome",
+            count_secondary_reason(df, "individual_or_firm_performance_without_team_unit_outcome"),
+        ),
+        (
+            "count_ineligible_publication_type",
+            int((df["primary_reason"] == "ineligible_publication_type").sum()),
+        ),
     ]
 
     reason_counts = (
@@ -1222,6 +1348,27 @@ def build_rules_audit() -> pd.DataFrame:
             "Revised rule: unpublished papers, working papers, preprints, and manuscripts are excluded. "
             "Eligible publication types are scholarly journal articles, dissertations/theses, and book chapters."
         )),
+        ("review_meta_exclusion_rule", (
+            "Reviews and meta-analyses are excluded as ineligible publication types, including variants such as "
+            "systematic review, narrative review, meta-analyses, meta-analytic, and meta-analytical correlation matrix. "
+            "Bare 'review' is not used because it may falsely match 'peer reviewed'."
+        )),
+        ("outcome_exclusion_rule", (
+            "Records with TMX/LMX but no performance/effectiveness-related outcome signal are excluded. "
+            "Records with only non-performance outcomes (e.g., satisfaction, trust, cohesion, OCB, commitment, "
+            "thriving, voice, psychological safety, engagement, burnout, turnover intention) and no eligible "
+            "team/group/unit performance/effectiveness outcome are excluded."
+        )),
+        ("individual_performance_exclusion_rule", (
+            "Records with only individual-level or firm/organization-level performance (e.g., employee performance, "
+            "job performance, leader performance, firm performance, organizational performance) are excluded unless "
+            "a credible team/group/unit/store/branch/outlet performance/effectiveness outcome is also indicated."
+        )),
+        ("vague_outcome_manual_review_rule", (
+            "Records with vague performance/effectiveness wording but unclear team/group/unit level are retained "
+            "for maybe_manual_review. Absence of raw correlation, sample size, or extractable effect size in the "
+            "abstract is not a reason to exclude during abstract screening; those are full-text coding issues."
+        )),
         ("decisions", "include_likely | maybe_manual_review | exclude_likely"),
         ("date_cutoff", f"Exclude when publication date is clearly after {DATE_CUTOFF.isoformat()}"),
         ("rule_priority_1", "date_after_cutoff -> exclude_likely"),
@@ -1230,13 +1377,17 @@ def build_rules_audit() -> pd.DataFrame:
         ("rule_priority_4", "ineligible_publication_type -> exclude_likely"),
         ("rule_priority_5", "no_direct_tmx_lmx_in_title_or_abstract -> exclude_likely"),
         ("rule_priority_6", "innovation/creativity-only outcome -> exclude_likely"),
-        ("rule_priority_7", "TMX/LMX + eligible performance + clear team/unit level -> include_likely"),
-        ("rule_priority_8", "TMX/LMX + eligible performance but level unclear -> maybe_manual_review"),
-        ("rule_priority_9", "TMX/LMX but outcome unclear -> maybe_manual_review"),
-        ("rule_priority_10", "Missing/short title or abstract -> maybe_manual_review"),
+        ("rule_priority_7", "non-performance outcome only -> exclude_likely"),
+        ("rule_priority_8", "individual/firm performance without team/unit outcome -> exclude_likely"),
+        ("rule_priority_9", "TMX/LMX + eligible performance + clear team/unit level -> include_likely"),
+        ("rule_priority_10", "TMX/LMX + eligible performance but level unclear -> maybe_manual_review"),
+        ("rule_priority_11", "TMX/LMX but no performance/effectiveness-related outcome -> exclude_likely"),
+        ("rule_priority_12", "TMX/LMX + vague outcome wording but team/unit level unclear -> maybe_manual_review"),
+        ("rule_priority_13", "Missing/short title or abstract -> maybe_manual_review"),
         ("direct_tmx_lmx_terms", "; ".join(DIRECT_TMX_LMX_PHRASES)),
         ("exchange_equivalent_terms", "; ".join(EXCHANGE_EQUIVALENT_PHRASES)),
         ("eligible_performance_terms", "; ".join(ELIGIBLE_TEAM_PERFORMANCE_PHRASES)),
+        ("outcome_related_terms", "; ".join(PERFORMANCE_EFFECTIVENESS_OUTCOME_PHRASES)),
         ("innovation_creativity_exclusion_terms", "; ".join(INNOVATION_CREATIVITY_PHRASES)),
         ("unpublished_exclusion_terms", "; ".join(UNPUBLISHED_PUBLICATION_PHRASES)),
         ("team_context_terms", "; ".join(TEAM_CONTEXT_PHRASES[:30]) + "; ..."),
@@ -1302,6 +1453,8 @@ def write_output(
     output_path: Path,
 ) -> None:
     screened_sorted = sort_screened_records(screened)
+    if "screening_text" in screened_sorted.columns:
+        screened_sorted = screened_sorted.drop(columns=["screening_text"])
 
     sheets = {
         "screened_records": screened_sorted,
@@ -1369,6 +1522,23 @@ TEST_CASE_LMX_TEAM_PERFORMANCE = (
 
 TEST_CASE_WORKING_PAPER = (
     "Leader-member exchange was examined in relation to team performance using survey data."
+)
+
+TEST_CASE_META_ANALYSIS_VARIANT = (
+    "A meta-analytical correlation matrix was constructed from prior studies. "
+    "Meta-analyses revealed consistent associations involving leader-member-exchange."
+)
+
+TEST_CASE_LMX_TRUST_ONLY = (
+    "This study examines leader-member exchange and trust among work teams in organizational settings."
+)
+
+TEST_CASE_LMX_TEAM_PERFORMANCE_LEVEL_UNCLEAR = (
+    "Leader-member exchange was related to team performance in organizations."
+)
+
+TEST_CASE_LMX_TEAM_LEVEL_PERFORMANCE = (
+    "Team-level LMX was positively related to team performance in organizational work teams."
 )
 
 
@@ -1474,10 +1644,11 @@ def run_classification_tests() -> bool:
     )
 
     assert_classification(
-        "LMX with employee job performance (level unclear)",
+        "LMX with employee job performance (individual-level only)",
         _test_row("LMX and employee job performance", TEST_CASE_LMX_INDIVIDUAL_JOB),
-        expected_decision="maybe_manual_review",
-        forbidden_decisions=["exclude_likely"],
+        expected_decision="exclude_likely",
+        expected_primary="no_eligible_performance_effectiveness_outcome",
+        required_secondary=["individual_or_firm_performance_without_team_unit_outcome"],
     )
 
     assert_classification(
@@ -1485,6 +1656,34 @@ def run_classification_tests() -> bool:
         _test_row("LMX and individual job performance only", TEST_CASE_LMX_INDIVIDUAL_ONLY),
         expected_decision="exclude_likely",
         expected_primary="wrong_level_individual_only",
+    )
+
+    assert_classification(
+        "Meta-analysis variant should be excluded",
+        _test_row("Meta-analytical LMX synthesis", TEST_CASE_META_ANALYSIS_VARIANT),
+        expected_decision="exclude_likely",
+        expected_primary="ineligible_publication_type",
+    )
+
+    assert_classification(
+        "LMX present but no performance/effectiveness outcome",
+        _test_row("LMX and trust in teams", TEST_CASE_LMX_TRUST_ONLY),
+        expected_decision="exclude_likely",
+        expected_primary="no_eligible_performance_effectiveness_outcome",
+        required_secondary=["non_performance_outcome_only"],
+    )
+
+    assert_classification(
+        "LMX + team performance but level unclear",
+        _test_row("LMX and team performance", TEST_CASE_LMX_TEAM_PERFORMANCE_LEVEL_UNCLEAR),
+        expected_decision={"include_likely", "maybe_manual_review"},
+        forbidden_decisions=["exclude_likely"],
+    )
+
+    assert_classification(
+        "LMX + team-level LMX + team performance",
+        _test_row("Team-level LMX and team performance", TEST_CASE_LMX_TEAM_LEVEL_PERFORMANCE),
+        expected_decision="include_likely",
     )
 
     if checks_passed:

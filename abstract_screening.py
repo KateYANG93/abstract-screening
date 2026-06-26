@@ -15,7 +15,6 @@ import argparse
 import re
 import sys
 import unicodedata
-from datetime import date, datetime
 from pathlib import Path
 
 import pandas as pd
@@ -29,7 +28,6 @@ DEFAULT_INPUT = Path(r"C:\Lingnan University\Mini meta\dedup\dedup_meta_analysis
 DEFAULT_SHEET = "unique_records"
 DEFAULT_OUTPUT = Path(__file__).resolve().parent / "abstract_screening_output.xlsx"
 
-DATE_CUTOFF = date(2026, 5, 31)
 MIN_ABSTRACT_CHARS = 80
 MIN_TITLE_CHARS = 10
 
@@ -426,50 +424,16 @@ INDIVIDUAL_LEVEL_FOCUS_PHRASES = [
     "personal performance",
 ]
 
-UNPUBLISHED_PUBLICATION_PHRASES = [
-    "unpublished paper",
-    "unpublished manuscript",
-    "unpublished study",
-    "unpublished data",
-    "working paper",
-    "working manuscript",
-    "preprint",
-    "ssrn",
-    "research square",
-    "arxiv",
-    "posted manuscript",
-    "manuscript",
-]
-
-ELIGIBLE_PUBLICATION_OVERRIDE_PHRASES = [
-    "journal article",
-    "scholarly journal",
-    "peer reviewed",
-    "peer-reviewed",
-    "dissertation",
-    "thesis",
-    "doctoral dissertation",
-    "phd dissertation",
-    "master thesis",
-    "masters thesis",
-    "book chapter",
-    "published article",
-    "published in",
-]
-
-INELIGIBLE_PUBLICATION_PHRASES = [
-    "conceptual paper",
-    "conceptual article",
-    "theoretical paper",
-    "theoretical article",
-    "qualitative only",
-    "qualitative study only",
+WEAK_REVIEW_BACKGROUND_PHRASES = [
     "literature review",
+    "research review",
+]
+
+STRONG_REVIEW_META_PHRASES = [
     "systematic review",
     "narrative review",
     "scoping review",
     "review article",
-    "research review",
     "integrative review",
     "bibliometric review",
     "meta analysis",
@@ -480,11 +444,18 @@ INELIGIBLE_PUBLICATION_PHRASES = [
     "meta-analytic",
     "meta analytical",
     "meta-analytical",
-    "meta analytically",
-    "meta-analytically",
     "meta analytical correlation matrix",
     "meta-analytical correlation matrix",
     "meta analytic correlation matrix",
+]
+
+OTHER_INELIGIBLE_PUBLICATION_PHRASES = [
+    "conceptual paper",
+    "conceptual article",
+    "theoretical paper",
+    "theoretical article",
+    "qualitative only",
+    "qualitative study only",
     "editorial",
     "commentary",
     "practitioner article",
@@ -496,6 +467,47 @@ INELIGIBLE_PUBLICATION_PHRASES = [
     "conference abstract only",
     "meeting abstract only",
 ]
+
+EMPIRICAL_STUDY_EVIDENCE_PHRASES = [
+    "empirical study",
+    "empirical research",
+    "survey",
+    "survey data",
+    "questionnaire",
+    "data collected",
+    "two wave data",
+    "two-wave data",
+    "sample",
+    "sample of",
+    "respondents",
+    "employees",
+    "subordinates",
+    "supervisors",
+    "teams",
+    "companies",
+    "firms",
+    "regression",
+    "hierarchical multiple regression",
+    "structural equation modeling",
+    "structural equation model",
+    "structural equation",
+    "sem",
+    "hlm",
+    "tested the model",
+    "tested the hypothesis",
+    "tested the hypotheses",
+    "field study",
+    "cross sectional",
+    "cross-sectional",
+    "self reported questionnaire",
+    "self-reported questionnaire",
+]
+
+INELIGIBLE_PUBLICATION_PHRASES = (
+    OTHER_INELIGIBLE_PUBLICATION_PHRASES
+    + WEAK_REVIEW_BACKGROUND_PHRASES
+    + STRONG_REVIEW_META_PHRASES
+)
 
 CONFERENCE_METADATA_PHRASES = [
     "conference paper",
@@ -555,23 +567,15 @@ SCREENING_COLUMNS = [
     "screen_decision",
     "screen_confidence",
     "primary_reason",
-    "secondary_reasons",
     "inclusion_signals",
     "exclusion_signals",
     "direct_tmx_lmx_title_abstract_signal",
-    "tmx_lmx_signal",
     "performance_signal",
-    "outcome_related_signal",
-    "innovation_creativity_only_signal",
-    "unpublished_signal",
     "team_context_signal",
     "team_level_signal",
     "quantitative_signal",
     "wrong_context_signal",
     "wrong_publication_type_signal",
-    "date_cutoff_flag",
-    "needs_full_text_check",
-    "abstract_screening_note",
 ]
 
 
@@ -675,6 +679,95 @@ def join_title_abstract_text(row: pd.Series) -> str:
     return " ".join(parts)
 
 
+def get_publication_type_metadata_text(row: pd.Series) -> str:
+    parts: list[str] = []
+    for field in ("publication_type", "document_type", "source_type", "genre"):
+        if field in row.index and not is_blank(row.get(field)):
+            parts.append(str(row.get(field)))
+    return normalize_text(" ".join(parts))
+
+
+def get_journal_text(row: pd.Series) -> str:
+    if "academic journal" not in row.index or is_blank(row.get("academic journal")):
+        return ""
+    return normalize_text(str(row.get("academic journal")))
+
+
+def get_title_abstract_text(row: pd.Series) -> str:
+    return normalize_text(join_title_abstract_text(row))
+
+
+def has_empirical_study_evidence(text: str) -> bool:
+    """Return True when text contains clear empirical-study indicators."""
+    normalized = normalize_text(text)
+    if not normalized:
+        return False
+    if match_phrases(normalized, EMPIRICAL_STUDY_EVIDENCE_PHRASES):
+        return True
+    if re.search(r"\bn\s*=\s*\d+", normalized):
+        return True
+    if re.search(
+        r"\b\d+\s+(employees|subordinates|supervisors|respondents|participants|"
+        r"teams|companies|firms|organizations|organisations)\b",
+        normalized,
+    ):
+        return True
+    return False
+
+
+def _append_unique_matches(target: list[str], phrases: list[str]) -> None:
+    for phrase in phrases:
+        if phrase not in target:
+            target.append(phrase)
+
+
+def detect_ineligible_publication_type(row: pd.Series) -> list[str]:
+    """
+    Context-aware ineligible publication detection.
+
+    Journal names are not treated as article-type evidence. Weak review-background
+    phrases are ignored when empirical study evidence is present in title/abstract.
+    """
+    title_abstract_text = get_title_abstract_text(row)
+    title_text = normalize_text(row.get("title")) if not is_blank(row.get("title")) else ""
+    abstract_text = normalize_text(row.get("abstract")) if not is_blank(row.get("abstract")) else ""
+    metadata_text = get_publication_type_metadata_text(row)
+    has_empirical = has_empirical_study_evidence(title_abstract_text)
+
+    matches: list[str] = []
+
+    for text in (metadata_text, title_abstract_text):
+        if text:
+            _append_unique_matches(matches, match_phrases(text, OTHER_INELIGIBLE_PUBLICATION_PHRASES))
+
+    if metadata_text:
+        _append_unique_matches(matches, match_phrases(metadata_text, STRONG_REVIEW_META_PHRASES))
+
+    if title_text:
+        _append_unique_matches(matches, match_phrases(title_text, STRONG_REVIEW_META_PHRASES))
+
+    if abstract_text:
+        abstract_strong = match_phrases(abstract_text, STRONG_REVIEW_META_PHRASES)
+        title_strong = set(match_phrases(title_text, STRONG_REVIEW_META_PHRASES)) if title_text else set()
+        metadata_strong = set(match_phrases(metadata_text, STRONG_REVIEW_META_PHRASES)) if metadata_text else set()
+        for phrase in abstract_strong:
+            if phrase in title_strong or phrase in metadata_strong:
+                continue
+            if has_empirical:
+                continue
+            _append_unique_matches(matches, [phrase])
+
+    weak_matches: list[str] = []
+    if title_text:
+        _append_unique_matches(weak_matches, match_phrases(title_text, WEAK_REVIEW_BACKGROUND_PHRASES))
+    if abstract_text:
+        _append_unique_matches(weak_matches, match_phrases(abstract_text, WEAK_REVIEW_BACKGROUND_PHRASES))
+    if weak_matches and not has_empirical:
+        _append_unique_matches(matches, weak_matches)
+
+    return matches
+
+
 def has_direct_tmx_lmx_signal(title, abstract) -> bool:
     """
     Return True only when title or abstract contains a direct TMX/LMX-family term
@@ -690,137 +783,9 @@ def has_direct_tmx_lmx_signal(title, abstract) -> bool:
     return bool(match_phrases(title_abstract_text, EXCHANGE_EQUIVALENT_PHRASES))
 
 
-def join_publication_metadata_text(row: pd.Series) -> str:
-    parts: list[str] = []
-    for field in (
-        "title",
-        "abstract",
-        "publication_type",
-        "document_type",
-        "source_type",
-        "genre",
-        "academic journal",
-        "url",
-    ):
-        if field in row.index and not is_blank(row.get(field)):
-            parts.append(str(row.get(field)))
-    return " ".join(parts)
-
-
-def detect_unpublished_signal(row: pd.Series) -> tuple[bool, list[str]]:
-    """Detect unpublished/working-paper/preprint indicators in metadata, title, or abstract."""
-    combined = normalize_text(join_publication_metadata_text(row))
-    if not combined:
-        return False, []
-
-    matched = match_phrases(combined, UNPUBLISHED_PUBLICATION_PHRASES)
-    if not matched:
-        return False, []
-
-    override = match_phrases(combined, ELIGIBLE_PUBLICATION_OVERRIDE_PHRASES)
-    strong_unpublished = [
-        phrase for phrase in matched
-        if phrase not in {"manuscript"}
-    ]
-    if strong_unpublished:
-        return True, strong_unpublished
-
-    if "manuscript" in matched and not override:
-        return True, ["manuscript"]
-
-    return False, []
-
-
 # =============================================================================
-# Date and language checks
+# Language checks
 # =============================================================================
-
-def parse_publication_date(value) -> date | None:
-    """Parse publication date from varied formats."""
-    if is_blank(value):
-        return None
-
-    if isinstance(value, (int, float)) and not pd.isna(value):
-        text = str(int(value))
-    else:
-        text = str(value).strip()
-
-    if re.fullmatch(r"(19|20)\d{6}", text):
-        try:
-            return datetime.strptime(text, "%Y%m%d").date()
-        except ValueError:
-            pass
-
-    if re.fullmatch(r"(19|20)\d{2}", text):
-        return date(int(text), 12, 31)
-
-    if re.match(r"^(19|20)\d{2}\d{2}\d{2}$", text):
-        try:
-            return datetime.strptime(text[:8], "%Y%m%d").date()
-        except ValueError:
-            pass
-
-    for fmt in ("%Y-%m-%d", "%Y/%m/%d", "%d/%m/%Y", "%m/%d/%Y", "%Y-%m", "%Y/%m"):
-        try:
-            parsed = datetime.strptime(text[:10], fmt)
-            return parsed.date()
-        except ValueError:
-            continue
-
-    year_match = re.search(r"\b(19|20)\d{2}\b", text)
-    if year_match:
-        year = int(year_match.group())
-        month_match = re.search(
-            r"\b(jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec|"
-            r"january|february|march|april|may|june|july|august|"
-            r"september|october|november|december)\b",
-            text.lower(),
-        )
-        if month_match:
-            month_token = month_match.group()[:3].title()
-            month_map = {
-                "Jan": 1, "Feb": 2, "Mar": 3, "Apr": 4, "May": 5, "Jun": 6,
-                "Jul": 7, "Aug": 8, "Sep": 9, "Oct": 10, "Nov": 11, "Dec": 12,
-            }
-            month = month_map.get(month_token, 12)
-            day_match = re.search(r"\b([0-3]?\d)\b", text[month_match.end():])
-            day = int(day_match.group(1)) if day_match else 1
-            try:
-                return date(year, month, day)
-            except ValueError:
-                return date(year, 12, 31)
-        return date(year, 12, 31)
-
-    return None
-
-
-def check_date_cutoff(row: pd.Series) -> tuple[str, date | None]:
-    """
-    Return date_cutoff_flag and parsed date.
-
-    Flags:
-        after_cutoff - clearly after May 31, 2026
-        before_cutoff - clearly on/before cutoff
-        unclear - missing or ambiguous date
-    """
-    candidates = [row.get("publicationDate"), row.get("year_clean")]
-    parsed_dates: list[date] = []
-
-    for candidate in candidates:
-        if is_blank(candidate):
-            continue
-        parsed = parse_publication_date(candidate)
-        if parsed is not None:
-            parsed_dates.append(parsed)
-
-    if not parsed_dates:
-        return "unclear", None
-
-    latest = max(parsed_dates)
-    if latest > DATE_CUTOFF:
-        return "after_cutoff", latest
-    return "before_cutoff", latest
-
 
 def looks_english_text(text: str, *, min_alpha_chars: int = 12) -> bool:
     """Conservative English detection; ambiguous text is treated as English."""
@@ -864,42 +829,27 @@ def looks_english_text(text: str, *, min_alpha_chars: int = 12) -> bool:
     return ascii_alpha >= min_alpha_chars and ascii_ratio >= 0.80
 
 
-def is_clearly_non_english(row: pd.Series, screening_text: str) -> bool:
+def is_clearly_non_english_title(row: pd.Series) -> bool:
+    """Return True only when the title is clearly non-English."""
     title = str(row.get("title") or "")
-    abstract = str(row.get("abstract") or "")
 
     if is_blank(title):
         return False
 
-    combined_raw = f"{title} {abstract}"
-    if "\ufffd" in combined_raw:
-        normalized = normalize_text(combined_raw)
+    if "\ufffd" in title:
+        normalized = normalize_text(title)
         non_english_tokens = sum(1 for token in normalized.split() if token in NON_ENGLISH_FUNCTION_WORDS)
         english_tokens = sum(1 for token in normalized.split() if token in ENGLISH_FUNCTION_WORDS)
         if non_english_tokens >= 2 and non_english_tokens > english_tokens:
             return True
 
-    def non_ascii_alpha_ratio(text: str) -> float:
-        alpha = [char for char in text if char.isalpha()]
-        if not alpha:
-            return 0.0
+    alpha = [char for char in title if char.isalpha()]
+    if alpha:
         non_ascii = sum(1 for char in alpha if not char.isascii())
-        return non_ascii / len(alpha)
+        if non_ascii / len(alpha) >= 0.20:
+            return True
 
-    # Original-script check before ASCII folding strips diacritics/non-Latin letters.
-    if non_ascii_alpha_ratio(title) >= 0.20:
-        return True
-    if not is_blank(abstract) and non_ascii_alpha_ratio(abstract) >= 0.25:
-        return True
-
-    title_english = looks_english_text(title, min_alpha_chars=8)
-    if not title_english:
-        return True
-
-    if not is_blank(abstract) and not looks_english_text(abstract):
-        return True
-
-    return False
+    return not looks_english_text(title, min_alpha_chars=8)
 
 
 # =============================================================================
@@ -909,20 +859,13 @@ def is_clearly_non_english(row: pd.Series, screening_text: str) -> bool:
 def extract_signals(row: pd.Series, screening_text: str) -> dict:
     title_text = normalize_text(row.get("title"))
     abstract_text = normalize_text(row.get("abstract"))
-    title_abstract_text = normalize_text(join_title_abstract_text(row))
-    metadata_text = normalize_text(
-        " ".join(
-            str(row.get(field) or "")
-            for field in ("publication_type", "document_type", "source_type", "genre", "academic journal")
-            if field in row.index
-        )
-    )
+    title_abstract_text = get_title_abstract_text(row)
+    metadata_text = get_publication_type_metadata_text(row)
 
     direct_tmx_lmx = match_phrases(title_abstract_text, DIRECT_TMX_LMX_PHRASES)
     direct_exchange_equiv = match_phrases(title_abstract_text, EXCHANGE_EQUIVALENT_PHRASES)
     has_direct_tmx = bool(direct_tmx_lmx or direct_exchange_equiv)
 
-    tmx_lmx = direct_tmx_lmx + [p for p in direct_exchange_equiv if p not in direct_tmx_lmx]
     team_context = match_phrases(screening_text, TEAM_CONTEXT_PHRASES)
     performance_info = classify_performance_signals(screening_text)
     eligible_performance = performance_info["eligible_performance"]
@@ -936,13 +879,10 @@ def extract_signals(row: pd.Series, screening_text: str) -> dict:
     other_leadership = match_phrases(screening_text, GENERAL_LEADERSHIP_CONSTRUCT_PHRASES)
     other_non_exchange = match_phrases(screening_text, OTHER_NON_EXCHANGE_CONSTRUCT_PHRASES)
     individual_level_focus = match_phrases(screening_text, INDIVIDUAL_LEVEL_FOCUS_PHRASES)
-    ineligible_pub = match_phrases(screening_text, INELIGIBLE_PUBLICATION_PHRASES)
+    ineligible_pub = detect_ineligible_publication_type(row)
     conference_meta = match_phrases(metadata_text, CONFERENCE_METADATA_PHRASES)
     individual_only = match_phrases(screening_text, INDIVIDUAL_LEVEL_ONLY_PHRASES)
     qualitative_only = match_phrases(screening_text, QUALITATIVE_ONLY_PHRASES)
-    is_unpublished, unpublished_matches = detect_unpublished_signal(row)
-
-    date_flag, parsed_date = check_date_cutoff(row)
 
     title_len = len(title_text)
     abstract_len = len(abstract_text)
@@ -961,7 +901,6 @@ def extract_signals(row: pd.Series, screening_text: str) -> dict:
     )
 
     return {
-        "tmx_lmx": tmx_lmx,
         "direct_tmx_lmx": direct_tmx_lmx + direct_exchange_equiv,
         "has_direct_tmx_lmx": has_direct_tmx,
         "team_context": team_context,
@@ -983,10 +922,6 @@ def extract_signals(row: pd.Series, screening_text: str) -> dict:
         "conference_meta": conference_meta,
         "individual_only": individual_only,
         "qualitative_only": qualitative_only,
-        "is_unpublished": is_unpublished,
-        "unpublished_matches": unpublished_matches,
-        "date_flag": date_flag,
-        "parsed_date": parsed_date,
         "insufficient_text": insufficient_text,
         "performance_only_non_perf": performance_only_non_perf,
         "has_eligible_performance": performance_info["has_eligible_performance"],
@@ -1009,8 +944,6 @@ def classify_record(row: pd.Series) -> dict:
 
     inclusion_signals: list[str] = []
     exclusion_signals: list[str] = []
-    secondary_reasons: list[str] = []
-    notes: list[str] = []
 
     if signals["direct_tmx_lmx"]:
         inclusion_signals.append("direct_tmx_lmx:" + ",".join(signals["direct_tmx_lmx"][:5]))
@@ -1031,10 +964,6 @@ def classify_record(row: pd.Series) -> dict:
 
     if signals["wrong_context"]:
         exclusion_signals.append("wrong_context:" + ",".join(signals["wrong_context"][:5]))
-    if signals["is_unpublished"]:
-        exclusion_signals.append(
-            "unpublished:" + ",".join(signals["unpublished_matches"][:5])
-        )
     if signals["ineligible_pub"]:
         exclusion_signals.append("ineligible_pub:" + ",".join(signals["ineligible_pub"][:5]))
     if signals["conference_meta"]:
@@ -1043,11 +972,8 @@ def classify_record(row: pd.Series) -> dict:
         exclusion_signals.append("individual_level_only:" + ",".join(signals["individual_only"][:5]))
     if signals["qualitative_only"]:
         exclusion_signals.append("qualitative_only:" + ",".join(signals["qualitative_only"][:5]))
-    if signals["date_flag"] == "after_cutoff":
-        exclusion_signals.append("date_after_cutoff")
 
     has_direct_tmx = signals["has_direct_tmx_lmx"]
-    has_tmx_lmx = has_direct_tmx
     has_team_context = bool(signals["team_context"])
     has_eligible_performance = signals["has_eligible_performance"]
     has_innovation_creativity_only = signals["innovation_creativity_only"]
@@ -1057,154 +983,104 @@ def classify_record(row: pd.Series) -> dict:
     has_ineligible_pub = bool(signals["ineligible_pub"]) or bool(signals["conference_meta"])
     has_individual_only = bool(signals["individual_only"])
     has_qualitative_only = bool(signals["qualitative_only"])
-    is_unpublished = signals["is_unpublished"]
 
-    decision = "maybe_manual_review"
-    confidence = "low"
-    primary_reason = "uncertain_at_abstract_screening"
-    needs_full_text = True
-
-    # 1. Date after cutoff
-    if signals["date_flag"] == "after_cutoff":
+    if is_clearly_non_english_title(row):
         return _build_result(
-            screening_text, "exclude_likely", "high", "date_after_cutoff", secondary_reasons,
-            inclusion_signals, exclusion_signals, signals, False, notes,
+            screening_text, "exclude_likely", "high", "non_english",
+            inclusion_signals, exclusion_signals, signals,
         )
 
-    # 2. Clearly non-English
-    if is_clearly_non_english(row, normalized_text):
-        return _build_result(
-            screening_text, "exclude_likely", "high", "non_english", secondary_reasons,
-            inclusion_signals, exclusion_signals, signals, False, notes,
-        )
-
-    # Missing/short title or abstract -> manual review before construct checks
     if signals["insufficient_text"]:
-        secondary_reasons.append("title_or_abstract_too_short_or_missing")
         return _build_result(
             screening_text, "maybe_manual_review", "low", "insufficient_abstract_information",
-            secondary_reasons, inclusion_signals, exclusion_signals, signals, True, notes,
+            inclusion_signals, exclusion_signals, signals,
         )
 
-    # 3. Unpublished / working paper / preprint
-    if is_unpublished:
-        secondary_reasons.append("ineligible_publication_type")
-        return _build_result(
-            screening_text, "exclude_likely", "high", "unpublished_or_working_paper",
-            secondary_reasons, inclusion_signals, exclusion_signals, signals, False, notes,
-        )
-
-    # 4. Other ineligible publication type
     if has_qualitative_only and not has_quantitative:
-        secondary_reasons.append("ineligible_publication_type")
         return _build_result(
             screening_text, "exclude_likely", "high", "ineligible_publication_type",
-            secondary_reasons, inclusion_signals, exclusion_signals, signals, False, notes,
+            inclusion_signals, exclusion_signals, signals,
         )
     if has_ineligible_pub:
-        secondary_reasons.append("ineligible_publication_type")
         return _build_result(
             screening_text, "exclude_likely", "high", "ineligible_publication_type",
-            secondary_reasons, inclusion_signals, exclusion_signals, signals, False, notes,
+            inclusion_signals, exclusion_signals, signals,
         )
 
-    # 5. No direct TMX/LMX-family signal in title or abstract
     if not has_direct_tmx:
-        secondary_reasons.append("no_eligible_focal_construct")
         return _build_result(
             screening_text, "exclude_likely", "high", "no_direct_tmx_lmx_in_title_or_abstract",
-            secondary_reasons, inclusion_signals, exclusion_signals, signals, False, notes,
+            inclusion_signals, exclusion_signals, signals,
         )
 
-    # 6. Innovation/creativity-only outcome (even when TMX/LMX is present)
     if has_innovation_creativity_only:
-        secondary_reasons.append("innovation_or_creativity_only_outcome")
         return _build_result(
             screening_text, "exclude_likely", "high", "no_eligible_performance_effectiveness_outcome",
-            secondary_reasons, inclusion_signals, exclusion_signals, signals, False, notes,
+            inclusion_signals, exclusion_signals, signals,
         )
 
-    # Clearly individual-level only analysis without eligible team/unit performance
     if has_individual_only and not has_eligible_performance:
         return _build_result(
             screening_text, "exclude_likely", "high", "wrong_level_individual_only",
-            secondary_reasons, inclusion_signals, exclusion_signals, signals, False, notes,
+            inclusion_signals, exclusion_signals, signals,
         )
 
-    # 6b. Non-performance outcomes only (e.g., trust, satisfaction) without eligible performance
     if signals["performance_only_non_perf"] and not signals["has_outcome_related"]:
-        secondary_reasons.append("non_performance_outcome_only")
         return _build_result(
             screening_text, "exclude_likely", "high", "no_eligible_performance_effectiveness_outcome",
-            secondary_reasons, inclusion_signals, exclusion_signals, signals, False, notes,
+            inclusion_signals, exclusion_signals, signals,
         )
 
-    # 6c. Individual or firm/organization-level performance without team/unit outcome
     if signals["has_individual_performance"] and not has_eligible_performance:
-        secondary_reasons.append("individual_or_firm_performance_without_team_unit_outcome")
         return _build_result(
             screening_text, "exclude_likely", "high", "no_eligible_performance_effectiveness_outcome",
-            secondary_reasons, inclusion_signals, exclusion_signals, signals, False, notes,
+            inclusion_signals, exclusion_signals, signals,
         )
 
-    # Wrong student/lab context without organizational signals (TMX/LMX present)
     if has_wrong_context and not has_team_context:
         return _build_result(
             screening_text, "exclude_likely", "high", "wrong_context_student_or_lab",
-            secondary_reasons, inclusion_signals, exclusion_signals, signals, False, notes,
+            inclusion_signals, exclusion_signals, signals,
         )
     if has_wrong_context and has_team_context:
-        secondary_reasons.append("mixed_student_and_organizational_context")
         return _build_result(
             screening_text, "maybe_manual_review", "medium", "mixed_student_and_organizational_context",
-            secondary_reasons, inclusion_signals, exclusion_signals, signals, True, notes,
+            inclusion_signals, exclusion_signals, signals,
         )
 
-    # 7. TMX/LMX + eligible team/unit performance
     if has_eligible_performance:
         if has_team_level:
             confidence = "high" if has_quantitative else "medium"
-            needs_full_text = not has_quantitative
             return _build_result(
                 screening_text, "include_likely", confidence,
                 "eligible_tmx_lmx_performance_team_context_and_level",
-                secondary_reasons, inclusion_signals, exclusion_signals, signals,
-                needs_full_text, notes,
+                inclusion_signals, exclusion_signals, signals,
             )
         return _build_result(
             screening_text, "maybe_manual_review", "medium",
             "eligible_construct_and_outcome_but_level_unclear",
-            secondary_reasons, inclusion_signals, exclusion_signals, signals, True, notes,
+            inclusion_signals, exclusion_signals, signals,
         )
 
-    # 8. TMX/LMX present but no performance/effectiveness-related outcome
     if not signals["has_outcome_related"]:
-        secondary_reasons.append("no_performance_effectiveness_or_similar_outcome_signal")
         return _build_result(
             screening_text,
             "exclude_likely",
             "high",
             "no_eligible_performance_effectiveness_outcome",
-            secondary_reasons,
             inclusion_signals,
             exclusion_signals,
             signals,
-            False,
-            notes,
         )
 
-    # 9. TMX/LMX present and some outcome-related wording exists, but eligible team/unit outcome is unclear
     return _build_result(
         screening_text,
         "maybe_manual_review",
         "medium",
         "outcome_related_but_team_unit_level_unclear",
-        secondary_reasons,
         inclusion_signals,
         exclusion_signals,
         signals,
-        True,
-        notes,
     )
 
 
@@ -1213,45 +1089,26 @@ def _build_result(
     decision: str,
     confidence: str,
     primary_reason: str,
-    secondary_reasons: list[str],
     inclusion_signals: list[str],
     exclusion_signals: list[str],
     signals: dict,
-    needs_full_text: bool,
-    notes: list[str],
 ) -> dict:
-    if decision in {"include_likely", "maybe_manual_review"} and needs_full_text:
-        notes.append("Retain for full-text verification of level, effect size, and extractable association.")
-
-    if signals["date_flag"] == "unclear" and decision != "exclude_likely":
-        notes.append("Publication date missing or unclear; verify eligibility at full text.")
-
     return {
         "screening_text": screening_text,
         "screen_decision": decision,
         "screen_confidence": confidence,
         "primary_reason": primary_reason,
-        "secondary_reasons": format_signal_list(secondary_reasons),
         "inclusion_signals": format_signal_list(inclusion_signals),
         "exclusion_signals": format_signal_list(exclusion_signals),
         "direct_tmx_lmx_title_abstract_signal": format_signal_list(signals["direct_tmx_lmx"]),
-        "tmx_lmx_signal": format_signal_list(signals["tmx_lmx"]),
         "performance_signal": format_signal_list(signals["performance"]),
-        "outcome_related_signal": format_signal_list(signals["outcome_related"]),
-        "innovation_creativity_only_signal": (
-            "yes" if signals["innovation_creativity_only"] else ""
-        ),
-        "unpublished_signal": format_signal_list(signals["unpublished_matches"]),
         "team_context_signal": format_signal_list(signals["team_context"]),
         "team_level_signal": format_signal_list(signals["team_level"]),
         "quantitative_signal": format_signal_list(signals["quantitative"]),
         "wrong_context_signal": format_signal_list(signals["wrong_context"]),
         "wrong_publication_type_signal": format_signal_list(
-            signals["ineligible_pub"] + signals["conference_meta"] + signals["unpublished_matches"]
+            signals["ineligible_pub"] + signals["conference_meta"]
         ),
-        "date_cutoff_flag": signals["date_flag"],
-        "needs_full_text_check": needs_full_text,
-        "abstract_screening_note": " ".join(notes),
     }
 
 
@@ -1267,63 +1124,66 @@ def screen_dataframe(df: pd.DataFrame) -> pd.DataFrame:
 # Summary and audit
 # =============================================================================
 
-def count_secondary_reason(df: pd.DataFrame, reason: str) -> int:
-    return int(df["secondary_reasons"].fillna("").str.contains(reason, regex=False).sum())
-
-
 def build_screening_summary(df: pd.DataFrame) -> pd.DataFrame:
-    rows: list[tuple[str, int | str]] = [
-        ("total_input_records", len(df)),
-        ("count_include_likely", int((df["screen_decision"] == "include_likely").sum())),
-        ("count_maybe_manual_review", int((df["screen_decision"] == "maybe_manual_review").sum())),
-        ("count_exclude_likely", int((df["screen_decision"] == "exclude_likely").sum())),
-        ("count_tmx_lmx_signal", int((df["tmx_lmx_signal"] != "").sum())),
-        ("count_performance_signal", int((df["performance_signal"] != "").sum())),
-        ("count_team_context_signal", int((df["team_context_signal"] != "").sum())),
-        ("count_needs_full_text_check", int(df["needs_full_text_check"].astype(bool).sum())),
-        (
-            "count_no_direct_tmx_lmx_in_title_or_abstract",
-            int((df["primary_reason"] == "no_direct_tmx_lmx_in_title_or_abstract").sum()),
-        ),
-        (
-            "count_innovation_or_creativity_only_outcome",
-            count_secondary_reason(df, "innovation_or_creativity_only_outcome"),
-        ),
-        (
-            "count_unpublished_or_working_paper",
-            int((df["primary_reason"] == "unpublished_or_working_paper").sum()),
-        ),
-        (
-            "count_no_eligible_performance_effectiveness_outcome",
-            int((df["primary_reason"] == "no_eligible_performance_effectiveness_outcome").sum()),
-        ),
-        (
-            "count_non_performance_outcome_only",
-            count_secondary_reason(df, "non_performance_outcome_only"),
-        ),
-        (
-            "count_no_performance_effectiveness_or_similar_outcome_signal",
-            count_secondary_reason(df, "no_performance_effectiveness_or_similar_outcome_signal"),
-        ),
-        (
-            "count_individual_or_firm_performance_without_team_unit_outcome",
-            count_secondary_reason(df, "individual_or_firm_performance_without_team_unit_outcome"),
-        ),
-        (
-            "count_ineligible_publication_type",
-            int((df["primary_reason"] == "ineligible_publication_type").sum()),
-        ),
-    ]
+    rows: list[dict[str, str | int]] = []
 
-    reason_counts = (
-        df["primary_reason"]
-        .value_counts(dropna=False)
-        .sort_index()
+    def add_row(
+        metric: str,
+        count: int,
+        *,
+        screen_decision: str = "",
+        primary_reason: str = "",
+        note: str = "",
+    ) -> None:
+        rows.append({
+            "metric": metric,
+            "screen_decision": screen_decision,
+            "primary_reason": primary_reason,
+            "count": count,
+            "note": note,
+        })
+
+    total = len(df)
+    add_row("total_input_records", total, note="All input records")
+
+    decision_totals: list[int] = []
+    for decision in ("include_likely", "maybe_manual_review", "exclude_likely"):
+        decision_count = int((df["screen_decision"] == decision).sum())
+        decision_totals.append(decision_count)
+        add_row(
+            f"count_{decision}",
+            decision_count,
+            screen_decision=decision,
+            note=f"Total {decision}",
+        )
+
+        subset = df[df["screen_decision"] == decision]
+        reason_counts = subset["primary_reason"].value_counts(dropna=False).sort_index()
+        reason_sum = 0
+        for reason, count in reason_counts.items():
+            reason_label = str(reason)
+            reason_sum += int(count)
+            add_row(
+                f"count_{decision}__primary_reason:{reason_label}",
+                int(count),
+                screen_decision=decision,
+                primary_reason=reason_label,
+                note="Component of decision total",
+            )
+        add_row(
+            f"check_{decision}_primary_reason_sum",
+            reason_sum,
+            screen_decision=decision,
+            note=f"Should equal count_{decision}",
+        )
+
+    add_row(
+        "check_decision_counts_sum_to_total_input_records",
+        sum(decision_totals),
+        note="Should equal total_input_records",
     )
-    for reason, count in reason_counts.items():
-        rows.append((f"primary_reason:{reason}", int(count)))
 
-    return pd.DataFrame(rows, columns=["metric", "count"])
+    return pd.DataFrame(rows, columns=["metric", "screen_decision", "primary_reason", "count", "note"])
 
 
 def build_rules_audit() -> pd.DataFrame:
@@ -1331,7 +1191,11 @@ def build_rules_audit() -> pd.DataFrame:
         ("overview", (
             "Abstract screening for TMX/LMX and team/group/unit-level performance. "
             "Records must contain a direct TMX/LMX-family term in the title or abstract, "
-            "or a narrowly defined exchange-quality equivalent phrase, to be retained."
+            "or a narrowly defined exchange-quality equivalent phrase, to be retained. "
+            "The script does not apply publication date filtering; date range eligibility is "
+            "assumed to have been handled during database downloading/export. "
+            "Unpublished/working-paper/manuscript detection is not applied during abstract screening "
+            "to avoid false exclusions from phrases such as 'working paper' or 'manuscript' in abstracts."
         )),
         ("direct_tmx_lmx_rule", (
             "Revised rule: records are excluded at abstract screening if no direct TMX/LMX-family "
@@ -1344,14 +1208,13 @@ def build_rules_audit() -> pd.DataFrame:
             "and innovative behavior are not treated as eligible team performance/effectiveness outcomes. "
             "Records with only innovation/creativity outcomes are excluded."
         )),
-        ("unpublished_exclusion_rule", (
-            "Revised rule: unpublished papers, working papers, preprints, and manuscripts are excluded. "
-            "Eligible publication types are scholarly journal articles, dissertations/theses, and book chapters."
-        )),
         ("review_meta_exclusion_rule", (
-            "Reviews and meta-analyses are excluded as ineligible publication types, including variants such as "
-            "systematic review, narrative review, meta-analyses, meta-analytic, and meta-analytical correlation matrix. "
-            "Bare 'review' is not used because it may falsely match 'peer reviewed'."
+            "Review/meta-analysis exclusions are context-aware. Journal names are not treated as article-type "
+            "evidence, so journals such as Management Research Review do not trigger review exclusion by "
+            "themselves. Weak background phrases such as literature review or research review do not trigger "
+            "exclusion when the title/abstract clearly reports empirical data or statistical analysis. Strong "
+            "review/meta-analysis article types in publication metadata or title are still excluded; strong "
+            "phrases found only in the abstract are ignored when empirical evidence is present."
         )),
         ("outcome_exclusion_rule", (
             "Records with TMX/LMX but no performance/effectiveness-related outcome signal are excluded. "
@@ -1369,30 +1232,44 @@ def build_rules_audit() -> pd.DataFrame:
             "for maybe_manual_review. Absence of raw correlation, sample size, or extractable effect size in the "
             "abstract is not a reason to exclude during abstract screening; those are full-text coding issues."
         )),
+        ("summary_tab_rule", (
+            "The screening_summary tab groups primary-reason subtotals under each screen_decision total, "
+            "with check rows verifying that subtotals sum to their decision total and that decision totals "
+            "sum to total_input_records. Aggregate signal-count metrics are not included in the summary."
+        )),
+        ("literature_review_rule", (
+            "Weak review-background phrases (literature review, research review) are evaluated only in title "
+            "and abstract, never from journal names. They are ignored when empirical-study evidence is present."
+        )),
+        ("language_rule", (
+            "Only a clearly non-English title triggers exclusion (primary_reason = non_english). "
+            "A non-English abstract alone is not an exclusion criterion when the title is English or ambiguous."
+        )),
         ("decisions", "include_likely | maybe_manual_review | exclude_likely"),
-        ("date_cutoff", f"Exclude when publication date is clearly after {DATE_CUTOFF.isoformat()}"),
-        ("rule_priority_1", "date_after_cutoff -> exclude_likely"),
-        ("rule_priority_2", "non_english -> exclude_likely"),
-        ("rule_priority_3", "unpublished_or_working_paper -> exclude_likely"),
-        ("rule_priority_4", "ineligible_publication_type -> exclude_likely"),
-        ("rule_priority_5", "no_direct_tmx_lmx_in_title_or_abstract -> exclude_likely"),
-        ("rule_priority_6", "innovation/creativity-only outcome -> exclude_likely"),
-        ("rule_priority_7", "non-performance outcome only -> exclude_likely"),
-        ("rule_priority_8", "individual/firm performance without team/unit outcome -> exclude_likely"),
-        ("rule_priority_9", "TMX/LMX + eligible performance + clear team/unit level -> include_likely"),
-        ("rule_priority_10", "TMX/LMX + eligible performance but level unclear -> maybe_manual_review"),
-        ("rule_priority_11", "TMX/LMX but no performance/effectiveness-related outcome -> exclude_likely"),
-        ("rule_priority_12", "TMX/LMX + vague outcome wording but team/unit level unclear -> maybe_manual_review"),
-        ("rule_priority_13", "Missing/short title or abstract -> maybe_manual_review"),
+        ("rule_priority_1", "clearly non-English title -> exclude_likely"),
+        ("rule_priority_2", "insufficient title/abstract information -> maybe_manual_review"),
+        ("rule_priority_3", "ineligible_publication_type -> exclude_likely"),
+        ("rule_priority_4", "no_direct_tmx_lmx_in_title_or_abstract -> exclude_likely"),
+        ("rule_priority_5", "innovation/creativity-only outcome -> exclude_likely"),
+        ("rule_priority_6", "non-performance outcome only -> exclude_likely"),
+        ("rule_priority_7", "individual/firm performance without team/unit outcome -> exclude_likely"),
+        ("rule_priority_8", "TMX/LMX + eligible performance + clear team/unit level -> include_likely"),
+        ("rule_priority_9", "TMX/LMX + eligible performance but level unclear -> maybe_manual_review"),
+        ("rule_priority_10", "TMX/LMX but no performance/effectiveness-related outcome -> exclude_likely"),
+        ("rule_priority_11", "TMX/LMX + vague outcome wording but team/unit level unclear -> maybe_manual_review"),
         ("direct_tmx_lmx_terms", "; ".join(DIRECT_TMX_LMX_PHRASES)),
         ("exchange_equivalent_terms", "; ".join(EXCHANGE_EQUIVALENT_PHRASES)),
         ("eligible_performance_terms", "; ".join(ELIGIBLE_TEAM_PERFORMANCE_PHRASES)),
         ("outcome_related_terms", "; ".join(PERFORMANCE_EFFECTIVENESS_OUTCOME_PHRASES)),
         ("innovation_creativity_exclusion_terms", "; ".join(INNOVATION_CREATIVITY_PHRASES)),
-        ("unpublished_exclusion_terms", "; ".join(UNPUBLISHED_PUBLICATION_PHRASES)),
         ("team_context_terms", "; ".join(TEAM_CONTEXT_PHRASES[:30]) + "; ..."),
         ("team_level_terms", "; ".join(TEAM_LEVEL_PHRASES)),
-        ("ineligible_publication_terms", "; ".join(INELIGIBLE_PUBLICATION_PHRASES + CONFERENCE_METADATA_PHRASES)),
+        ("ineligible_publication_terms", (
+            "strong: " + "; ".join(STRONG_REVIEW_META_PHRASES)
+            + " | weak: " + "; ".join(WEAK_REVIEW_BACKGROUND_PHRASES)
+            + " | other: " + "; ".join(OTHER_INELIGIBLE_PUBLICATION_PHRASES)
+            + " | conference: " + "; ".join(CONFERENCE_METADATA_PHRASES)
+        )),
         ("overlap_note", "Suspected duplicate/overlapping samples are not removed here; assess during full-text coding."),
         ("text_normalization", "Lowercase, Unicode dash/apostrophe normalization, ASCII fold, punctuation removal, space collapse."),
         ("screening_text_fields", "; ".join(SCREENING_TEXT_FIELDS)),
@@ -1458,11 +1335,6 @@ def write_output(
 
     sheets = {
         "screened_records": screened_sorted,
-        "include_likely": screened_sorted[screened_sorted["screen_decision"] == "include_likely"].copy(),
-        "maybe_manual_review": screened_sorted[
-            screened_sorted["screen_decision"] == "maybe_manual_review"
-        ].copy(),
-        "exclude_likely": screened_sorted[screened_sorted["screen_decision"] == "exclude_likely"].copy(),
         "screening_summary": summary,
         "rules_audit": rules_audit,
     }
@@ -1520,10 +1392,6 @@ TEST_CASE_LMX_TEAM_PERFORMANCE = (
     "We examined leader-member exchange and team performance in a sample of organizational work teams."
 )
 
-TEST_CASE_WORKING_PAPER = (
-    "Leader-member exchange was examined in relation to team performance using survey data."
-)
-
 TEST_CASE_META_ANALYSIS_VARIANT = (
     "A meta-analytical correlation matrix was constructed from prior studies. "
     "Meta-analyses revealed consistent associations involving leader-member-exchange."
@@ -1539,6 +1407,46 @@ TEST_CASE_LMX_TEAM_PERFORMANCE_LEVEL_UNCLEAR = (
 
 TEST_CASE_LMX_TEAM_LEVEL_PERFORMANCE = (
     "Team-level LMX was positively related to team performance in organizational work teams."
+)
+
+TEST_CASE_EMPIRICAL_LITERATURE_REVIEW = (
+    "Purpose The purpose of this paper is to investigate the impact of native Chinese R&D team directors' "
+    "differential leadership on team performance... A literature review on differential leadership and team "
+    "conflict provided the model and hypothesis. Two-wave data collected from 103 directors and 344 "
+    "subordinates from 103 R&D teams of high-tech enterprises from China's Pearl River Delta Area were used "
+    "as empirical study samples. Hierarchical multiple regression analysis was conducted to test the model "
+    "and hypothesis."
+)
+
+TEST_CASE_TRUE_LITERATURE_REVIEW = (
+    "This article provides a literature review of differential leadership and organizational conflict. "
+    "The paper synthesizes prior theory and proposes directions for future research without new observations."
+)
+
+TEST_CASE_ENGLISH_TITLE_NON_ENGLISH_ABSTRACT = (
+    "Der Zweck dieser Studie ist es, den Zusammenhang zwischen Führungsqualität und Teamleistung "
+    "in organisationalen Arbeitsgruppen zu untersuchen. Die Daten wurden aus einer Umfrage von "
+    "Mitarbeitern und Vorgesetzten in mehreren Unternehmen erhoben."
+)
+
+TEST_CASE_NON_ENGLISH_TITLE = (
+    "Diese Studie untersucht die Auswirkungen von Führungsqualität auf die Teamleistung in "
+    "organisationalen Arbeitsgruppen mit Umfragedaten von Mitarbeitern und Vorgesetzten."
+)
+
+TEST_CASE_MANAGEMENT_RESEARCH_REVIEW_EMPIRICAL = (
+    "Purpose The purpose of this study is to describe and explain the relationship between perceived "
+    "social-organizational climate (PSOC), organizational citizenship behaviors (OCB) of other employees "
+    "and innovative workplace behaviors (IWB) initiated and performed by employees. The mediating role of "
+    "person-organization fit (P-O Fit) is tested within the relationship of PSOC, OCB and IWB. "
+    "Design/methodology/approach The study was conducted anonymously on a group of 246 employees from "
+    "76 companies operating in Poland. Structural equation modeling (SEM) was used in the process of "
+    "statistical analysis."
+)
+
+TEST_CASE_MRR_LMX_TEAM = (
+    "We examined leader-member exchange at the team level using aggregated member ratings in "
+    "organizational work teams. Team-level LMX was positively related to team performance."
 )
 
 
@@ -1561,25 +1469,25 @@ def run_classification_tests() -> bool:
         name: str,
         row: pd.Series,
         *,
-        expected_decision: str | set[str],
+        expected_decision: str | set[str] | None = None,
         expected_primary: str | None = None,
-        required_secondary: list[str] | None = None,
         forbidden_decisions: list[str] | None = None,
+        forbidden_primary: str | None = None,
     ) -> None:
         nonlocal checks_passed
         result = classify_record(row)
         decision = result["screen_decision"]
         primary = result["primary_reason"]
-        secondary = result["secondary_reasons"]
 
-        if isinstance(expected_decision, str):
-            expected_decisions = {expected_decision}
-        else:
-            expected_decisions = set(expected_decision)
+        if expected_decision is not None:
+            if isinstance(expected_decision, str):
+                expected_decisions = {expected_decision}
+            else:
+                expected_decisions = set(expected_decision)
 
-        if decision not in expected_decisions:
-            print(f"  [FAIL] {name}: decision={decision!r}, expected one of {sorted(expected_decisions)!r}")
-            checks_passed = False
+            if decision not in expected_decisions:
+                print(f"  [FAIL] {name}: decision={decision!r}, expected one of {sorted(expected_decisions)!r}")
+                checks_passed = False
 
         if expected_primary and primary != expected_primary:
             print(f"  [FAIL] {name}: primary_reason={primary!r}, expected {expected_primary!r}")
@@ -1589,11 +1497,9 @@ def run_classification_tests() -> bool:
             print(f"  [FAIL] {name}: decision {decision!r} should not be {forbidden_decisions!r}")
             checks_passed = False
 
-        if required_secondary:
-            for reason in required_secondary:
-                if reason not in secondary:
-                    print(f"  [FAIL] {name}: missing secondary reason {reason!r} in {secondary!r}")
-                    checks_passed = False
+        if forbidden_primary and primary == forbidden_primary:
+            print(f"  [FAIL] {name}: primary_reason={primary!r} should not be {forbidden_primary!r}")
+            checks_passed = False
 
     assert_classification(
         "Pakistani female leaders / transformational-transactional / innovative performance",
@@ -1607,7 +1513,6 @@ def run_classification_tests() -> bool:
         _test_row("LMX and team innovation", TEST_CASE_LMX_TEAM_INNOVATION_ONLY),
         expected_decision="exclude_likely",
         expected_primary="no_eligible_performance_effectiveness_outcome",
-        required_secondary=["innovation_or_creativity_only_outcome"],
     )
 
     assert_classification(
@@ -1625,18 +1530,6 @@ def run_classification_tests() -> bool:
     )
 
     assert_classification(
-        "Working paper / unpublished manuscript",
-        _test_row(
-            "LMX and team performance",
-            TEST_CASE_WORKING_PAPER,
-            publication_type="Working Paper",
-            document_type="Unpublished manuscript",
-        ),
-        expected_decision="exclude_likely",
-        expected_primary="unpublished_or_working_paper",
-    )
-
-    assert_classification(
         "LMX team-level with team performance",
         _test_row("Team-level LMX and team performance", TEST_CASE_LMX_TEAM),
         expected_decision={"include_likely", "maybe_manual_review"},
@@ -1648,7 +1541,6 @@ def run_classification_tests() -> bool:
         _test_row("LMX and employee job performance", TEST_CASE_LMX_INDIVIDUAL_JOB),
         expected_decision="exclude_likely",
         expected_primary="no_eligible_performance_effectiveness_outcome",
-        required_secondary=["individual_or_firm_performance_without_team_unit_outcome"],
     )
 
     assert_classification(
@@ -1670,7 +1562,6 @@ def run_classification_tests() -> bool:
         _test_row("LMX and trust in teams", TEST_CASE_LMX_TRUST_ONLY),
         expected_decision="exclude_likely",
         expected_primary="no_eligible_performance_effectiveness_outcome",
-        required_secondary=["non_performance_outcome_only"],
     )
 
     assert_classification(
@@ -1684,6 +1575,79 @@ def run_classification_tests() -> bool:
         "LMX + team-level LMX + team performance",
         _test_row("Team-level LMX and team performance", TEST_CASE_LMX_TEAM_LEVEL_PERFORMANCE),
         expected_decision="include_likely",
+    )
+
+    assert_classification(
+        "Empirical article from Management Research Review journal",
+        _test_row(
+            "Social-organizational climate and innovative workplace behaviors",
+            TEST_CASE_MANAGEMENT_RESEARCH_REVIEW_EMPIRICAL,
+            **{"academic journal": "Management Research Review"},
+        ),
+        expected_decision="exclude_likely",
+        expected_primary="no_direct_tmx_lmx_in_title_or_abstract",
+        forbidden_primary="ineligible_publication_type",
+    )
+
+    assert_classification(
+        "Management Research Review journal with LMX and team performance",
+        _test_row(
+            "Team-level leader-member exchange and team performance",
+            TEST_CASE_MRR_LMX_TEAM,
+            **{"academic journal": "Management Research Review"},
+        ),
+        expected_decision={"include_likely", "maybe_manual_review"},
+        forbidden_primary="ineligible_publication_type",
+    )
+
+    assert_classification(
+        "Empirical article mentioning literature review should not be ineligible_publication_type",
+        _test_row(
+            "Differential leadership and team performance in R&D teams",
+            TEST_CASE_EMPIRICAL_LITERATURE_REVIEW,
+        ),
+        expected_decision="exclude_likely",
+        expected_primary="no_direct_tmx_lmx_in_title_or_abstract",
+        forbidden_primary="ineligible_publication_type",
+    )
+
+    assert_classification(
+        "True literature review without empirical study evidence",
+        _test_row(
+            "A literature review of differential leadership and team conflict",
+            TEST_CASE_TRUE_LITERATURE_REVIEW,
+        ),
+        expected_decision="exclude_likely",
+        expected_primary="ineligible_publication_type",
+    )
+
+    assert_classification(
+        "Systematic review should still be excluded",
+        _test_row(
+            "A systematic review of leader-member exchange and team performance",
+            "This systematic review synthesizes prior studies on leader-member exchange and team performance.",
+        ),
+        expected_decision="exclude_likely",
+        expected_primary="ineligible_publication_type",
+    )
+
+    assert_classification(
+        "English title with non-English abstract should not be excluded as non_english",
+        _test_row(
+            "Leader-member exchange and team performance",
+            TEST_CASE_ENGLISH_TITLE_NON_ENGLISH_ABSTRACT,
+        ),
+        forbidden_primary="non_english",
+    )
+
+    assert_classification(
+        "Clearly non-English title should be excluded as non_english",
+        _test_row(
+            "领导成员交换与团队绩效的关系研究",
+            TEST_CASE_NON_ENGLISH_TITLE,
+        ),
+        expected_decision="exclude_likely",
+        expected_primary="non_english",
     )
 
     if checks_passed:
